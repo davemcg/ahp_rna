@@ -1,0 +1,127 @@
+---
+title: "Compare AHP Proteome against RNA TM"
+output:
+  html_notebook:
+    author: "David McGaughey"
+    date: "`r Sys.Date()`"
+    theme: flatly
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+# Load EiaD Data
+
+eyeIntegration.nei.nih.gov
+
+We have 4 TM RNA seq samples from two studies
+
+```{r load eiad}
+library(tidyverse)
+library(data.table)
+library(metamoRph)
+# load eiad counts
+eiad_counts <- read_csv('https://hpc.nih.gov/~mcgaugheyd/eyeIntegration/2023/gene_counts.csv.gz')
+# Load in metadata
+eiad_meta <- read_csv('https://hpc.nih.gov/~mcgaugheyd/eyeIntegration/2023/eyeIntegration22_meta_2023_03_03.csv.gz')
+
+tm_meta <- eiad_meta %>% filter(Tissue == 'Trabecular Meshwork') %>% 
+  select(-run_accession) %>% unique()
+tm_meta
+```
+
+
+```{r}
+
+tm_counts <- eiad_counts[,c('Gene', tm_meta$sample_accession)] 
+tm_counts <- tm_counts %>% mutate(Gene = gsub(" \\(.*","",Gene)) %>% data.table()
+# aggregate to the gene name level
+tm_counts <- tm_counts[, lapply(.SD, sum, na.rm=TRUE), by=Gene ]
+
+# take rowmeans
+tm_means <- metamoRph::normalize_data(tm_counts[,2:5]) %>% rowMeans() %>% enframe()
+tm_means$Gene <- tm_counts$Gene
+tm_means <- tm_means %>% select(Gene, 'Gene mean log1p(cpm)' = value)
+```
+# Load AHP processed proteome data
+
+Outliers removed. Metadata cleaned.
+From `01_proteome_overview.Rmd`
+```{r load proteome processed}
+load('../data/ahpdb_cleaned_data.Rdata')
+```
+
+# Normalize Proteome
+CPM, then log1p norm
+```{r}
+pmat <- metamoRph::normalize_data(proteome_mat_clean_filter)
+
+
+hgnc_uniprot <- read_tsv('../data/hgnc_uniprot_table.tsv')
+
+
+long_proteome <- rowMeans(pmat, na.rm = TRUE) %>% 
+  enframe(name = 'Accession',value = 'Protein mean log1p(cpm)') %>% 
+  left_join(hgnc_uniprot %>% select(Accession = `UniProt ID(supplied by UniProt)`, Gene = `Approved symbol`), by = 'Accession')
+```
+
+# Join together
+```{r}
+merged <- long_proteome %>% 
+  left_join(tm_means, by = c("Gene")) %>% filter(!is.na(`Gene mean log1p(cpm)`)) %>% 
+  left_join(proteome_meta %>% select(Accession, Protein_Name)) %>% relocate(Accession, Protein_Name, Gene)
+```
+
+# Distribution Comparison
+The proteome is so wildly right weighted that it makes the transcriptome data almost invisibile (so many proteome zeros)
+```{r}
+merged %>% 
+  pivot_longer(-c(Gene, Accession,Protein_Name)) %>% 
+  ggplot(
+  aes(x=value,color=name)) +
+  geom_density() +
+  cowplot::theme_cowplot()
+```
+
+
+# Correlation
+
+Not surprisingly, approximately zero
+```{r}
+cor(merged$`Protein mean log1p(cpm)`,merged$`Gene mean log1p(cpm)`)
+```
+
+If we use spearman correlation (which is ranked based), it is about 0.07. Still very low.
+```{r}
+cor(merged$`Protein mean log1p(cpm)`,merged$`Gene mean log1p(cpm)`, method = 'spearman')
+```
+
+# What genes/proteins have "high" expression in both the proteome and RNAseq data?
+
+I am going to "hand set" some different cutoffs for each technology to demarcate "high" expression. I'll return proteins/gene that are in the **top 90% for both technologies.**
+
+```{r}
+quantile(merged$`Protein mean log1p(cpm)`, seq(0,1,0.1)) %>% enframe(name = 'quantile', value = 'protein')
+quantile(merged$`Gene mean log1p(cpm)`, seq(0,1,0.1)) %>% enframe(name = 'quantile', value = 'RNAseq')
+```
+226 genes/proteins meet this criteria.
+
+```{r}
+merged %>% filter(`Protein mean log1p(cpm)` > quantile(merged$`Protein mean log1p(cpm)`, 0.9), 
+                  `Gene mean log1p(cpm)` > quantile(merged$`Gene mean log1p(cpm)`, 0.9)) %>% 
+  DT::datatable()
+
+
+write_csv(merged %>% filter(`Protein mean log1p(cpm)` > quantile(merged$`Protein mean log1p(cpm)`, 0.9), 
+                  `Gene mean log1p(cpm)` > quantile(merged$`Gene mean log1p(cpm)`, 0.9)),
+          '../data/top90_matched.csv')
+```
+
+# Done
+
+For now.
+
+# Session Info
+```{r}
+sessionInfo()
+```

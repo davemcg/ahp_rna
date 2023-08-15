@@ -1,0 +1,145 @@
+---
+title: "Proteome Quick Analysis"
+output:
+  html_notebook:
+    author: "David McGaughey"
+    date: "`r Sys.Date()`"
+    theme: flatly
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+
+Just checking my ability to load the [AHP data](http://ahp.augusta.edu) and see overall structure with a PCA
+
+```{r load}
+library(tidyverse)
+library(metamoRph)
+
+proteome_df <- data.table::fread('../data/AhpDb_PsmMatrix.csv')
+proteome_df <- proteome_df[-1,] # remove visual formatting line
+# make numeric
+proteome_matrix <- proteome_df[,-1] %>% as.matrix()
+mode(proteome_matrix) = "numeric"
+row.names(proteome_matrix) <- proteome_df$Accession
+proteome_meta <- read_delim('../data/AhpDb_ProteinSummary.csv', delim = 'asdf') 
+colnames(proteome_meta) <- 'one'
+
+# some wacky stuff to handle the ... interesting ... data format
+proteome_meta <- proteome_meta %>% 
+  mutate_if(is.character, utf8::utf8_encode) %>% 
+  separate(one, into = 
+             c("UniProt_Id", "Gene_Symbol", "Protein_Name", "Gene_Names", "Accession", "PsmSum", "MeanPsm", "PsmPresent", "PctPresent"), 
+           sep = '\\s\\s+,|,\\s\\s+')
+# first row is visual formatting
+# last row is empty
+proteome_meta <- proteome_meta[-c(1,1649),]
+
+sample_meta <- read_csv('../data/AhpDb_ClinicalData.csv')
+sample_meta <- sample_meta[-c(1,314),]
+```
+
+# PSM Sum Distributions
+Should remove the handful of samples with a PSM sum less than 2000 and sum normalize (a la TPM)
+```{r}
+proteome_matrix %>% as_tibble() %>% select(contains("AH")) %>% colSums(na.rm = TRUE) %>% density() %>% plot()
+
+proteome_matrix %>% as_tibble() %>% select(contains("AH")) %>% colSums(na.rm = TRUE) %>% summary()
+```
+
+# Remove low sum PSM samples
+```{r}
+remove_id <-  proteome_matrix %>% as_tibble() %>% select(contains("AH")) %>% colSums(na.rm = TRUE) %>% enframe() %>% filter(value < 2000)
+proteome_tib <- proteome_matrix %>% as_tibble(rownames = 'Accession') %>% select(-contains(remove_id$name))
+proteome_tib[is.na(proteome_tib)] <- 0
+```
+
+# Check per sample distributions
+
+First 100 samples
+
+VERY long right tail
+```{r, fig.height=10, fig.width=5}
+proteome_tib[,1:30] %>% pivot_longer(-Accession) %>% 
+  ggplot(aes(y=name,x=value)) +
+  ggridges::geom_density_ridges2() + 
+  cowplot::theme_cowplot()
+```
+## log1p() Transformed
+STILL crazy right tail. Essentially virtually all the data is near zero
+```{r, fig.height=10, fig.width=5}
+proteome_tib[,1:30] %>% pivot_longer(-Accession) %>% 
+  ggplot(aes(y=name,x=log1p(value))) +
+  ggridges::geom_density_ridges2() + 
+  ylab("Sample") +
+  cowplot::theme_cowplot()
+```
+
+## log1p() Transformed and remove low counts proteins
+
+Summary of row sums (summing all counts for each protein by sample)
+```{r}
+proteome_tib[,-1] %>% rowSums(na.rm = TRUE) %>% summary()
+```
+STILL STILL crazy right tail, even after removing all proteins with a sum < 311 (essentially average 1 count across the 311 samples)
+```{r, fig.height=10, fig.width=5}
+proteome_tib[proteome_tib[,-1] %>% rowSums(na.rm = TRUE) > 311,1:30] %>% 
+  pivot_longer(-Accession) %>% 
+  ggplot(aes(y=name,x=log1p(value))) +
+  ggridges::geom_density_ridges2() + 
+  ylab("Sample") +
+  cowplot::theme_cowplot()
+```
+
+
+# PCA
+Eight samples are REALLY different than the rest
+```{r}
+proteome_mat_clean <- proteome_tib %>% select(contains("AH")) %>% as.matrix()
+row.names(proteome_mat_clean) <- proteome_tib$Accession
+aligned_sample_meta <- colnames(proteome_mat_clean) %>% enframe(value = 'SampleId') %>% select(-name) %>% 
+  left_join(sample_meta)
+proteome_mat_clean[is.na(proteome_mat_clean)] <- 0
+pca_mm <- run_pca(proteome_mat_clean,aligned_sample_meta)
+
+plot <- pca_mm$PCA$x %>% as_tibble(rownames = 'SampleId') %>% 
+  left_join(pca_mm$meta, by = 'SampleId') %>% 
+  ggplot(aes(x=PC1,y=PC2,color = CD, label = SampleId)) + 
+  geom_point() +
+  scale_color_manual(values = pals::alphabet() %>% unname()) +
+  cowplot::theme_cowplot()
+plotly::ggplotly(plot)
+```
+
+# PCA Again
+Removing those eight samples and AH602 (top left) and redoing the PCA
+
+Looks reasonable now
+```{r}
+proteome_mat_clean_filter <- proteome_mat_clean[,pca_mm$PCA$x[,c('PC1','PC2')] %>% as_tibble(rownames = 'sample') %>%  filter(PC1 < 20, PC2 < 20) %>% pull(sample)]
+
+aligned_sample_meta <- colnames(proteome_mat_clean_filter) %>% enframe(value = 'SampleId') %>% select(-name) %>% 
+  left_join(sample_meta)
+
+pca_mm <- run_pca(proteome_mat_clean_filter,aligned_sample_meta)
+
+plot <- pca_mm$PCA$x %>% as_tibble(rownames = 'SampleId') %>% 
+  left_join(pca_mm$meta, by = 'SampleId') %>% 
+  ggplot(aes(x=PC1,y=PC2,color = CD, label = SampleId)) + 
+  geom_point() +
+  scale_color_manual(values = pals::alphabet() %>% unname()) +
+  cowplot::theme_cowplot()
+plotly::ggplotly(plot)
+```
+
+
+# Output cleaned data
+```{r}
+save(proteome_mat_clean_filter, aligned_sample_meta, proteome_meta, file = '../data/ahpdb_cleaned_data.Rdata')
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
